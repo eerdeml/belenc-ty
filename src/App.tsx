@@ -6,6 +6,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { GameEngine, GameStats, GameStatus } from './game/gameEngine';
 import { GameHUD } from './components/GameHUD';
+import { getBankCoins, getEquippedCar } from './game/cars';
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -16,9 +17,17 @@ export default function App() {
     score: 0,
     speedKmH: 100,
     coins: 0,
+    bankCoins: getBankCoins(),
     distanceMeters: 0,
     highScore: 0,
+    weatherMode: 'sunny',
+    isAutoWeather: true,
+    activePowerUps: [],
+    equippedCar: getEquippedCar(),
   });
+
+  const [latestAchievement, setLatestAchievement] = useState<any>(null);
+  const achievementTimeoutRef = useRef<number | null>(null);
 
   // Initialize Three.js engine once
   useEffect(() => {
@@ -31,11 +40,23 @@ export default function App() {
       onStatusChange: (newStatus) => {
         setGameStatus(newStatus);
       },
+      onAchievementUnlocked: (achievement) => {
+        setLatestAchievement(achievement);
+        if (achievementTimeoutRef.current) {
+          clearTimeout(achievementTimeoutRef.current);
+        }
+        achievementTimeoutRef.current = window.setTimeout(() => {
+          setLatestAchievement(null);
+        }, 4500);
+      },
     });
 
     engineRef.current = engine;
 
     return () => {
+      if (achievementTimeoutRef.current) {
+        clearTimeout(achievementTimeoutRef.current);
+      }
       engine.destroy();
       engineRef.current = null;
     };
@@ -57,6 +78,14 @@ export default function App() {
 
   const handleRestartGame = useCallback(() => {
     engineRef.current?.restartGame();
+  }, []);
+
+  const handleToggleWeather = useCallback(() => {
+    engineRef.current?.nextWeather();
+  }, []);
+
+  const handleReloadCar = useCallback(() => {
+    engineRef.current?.reloadEquippedCar();
   }, []);
 
   // Touch Swipe Gesture Detection for Mobile
@@ -104,10 +133,13 @@ export default function App() {
       <GameHUD
         status={gameStatus}
         stats={stats}
+        latestAchievement={latestAchievement}
         onLaneChange={handleLaneChange}
         onStartGame={handleStartGame}
         onTogglePause={handleTogglePause}
         onRestartGame={handleRestartGame}
+        onToggleWeather={handleToggleWeather}
+        onReloadCar={handleReloadCar}
       />
     </div>
   );

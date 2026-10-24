@@ -1,10 +1,22 @@
 /**
  * Procedural coastal highway road chunk and scenery manager.
- * Creates an endless 3-lane coastal road with ocean on the right and cliffs on the left.
+ * Creates an endless 3-lane coastal road with ocean on the right, cliffs on the left,
+ * roadside trees (palms & coastal pines), coastal lighthouse with rotating beacon, and seaside rocks.
  */
 
 import * as THREE from 'three';
-import { createPalmTree, createCliffRock, createWarningSign, createGuardrailSegment, createLighthouse, createSailboat } from './models';
+import {
+  createPalmTree,
+  createPineTree,
+  createCliffRock,
+  createWarningSign,
+  createGuardrailSegment,
+  createLighthouse,
+  createSailboat,
+  createHighwayLamp,
+  createCoastalBushes,
+  createBeachFence,
+} from './models';
 
 export const LANE_WIDTH = 2.4;
 export const LANE_POSITIONS = [-LANE_WIDTH, 0, LANE_WIDTH] as const;
@@ -33,13 +45,10 @@ function createRoadTexture(): THREE.CanvasTexture {
 
   // Solid outer border lines (Left & Right)
   ctx.fillStyle = '#f8fafc';
-  // Left outer solid line
   ctx.fillRect(20, 0, 10, 1024);
-  // Right outer solid line
   ctx.fillRect(482, 0, 10, 1024);
 
   // Dashed lines between lanes (2 dividers for 3 lanes)
-  // Lane 1 divider at ~1/3, Lane 2 divider at ~2/3
   const dashLength = 80;
   const gapLength = 65;
   const totalPeriod = dashLength + gapLength;
@@ -106,6 +115,25 @@ function createCliffTexture(): THREE.CanvasTexture {
   return tex;
 }
 
+// Roadside reflector bollard
+function createReflectorPost(isLeft: boolean): THREE.Group {
+  const post = new THREE.Group();
+  const poleMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.5 });
+  const capMat = new THREE.MeshBasicMaterial({ color: isLeft ? 0xffffff : 0xff7700 });
+
+  const poleGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.9, 8);
+  const poleMesh = new THREE.Mesh(poleGeo, poleMat);
+  poleMesh.position.y = 0.45;
+  post.add(poleMesh);
+
+  const capGeo = new THREE.BoxGeometry(0.08, 0.15, 0.08);
+  const capMesh = new THREE.Mesh(capGeo, capMat);
+  capMesh.position.y = 0.8;
+  post.add(capMesh);
+
+  return post;
+}
+
 export interface RoadChunk {
   group: THREE.Group;
   zCenter: number;
@@ -120,6 +148,7 @@ export class RoadManager {
   private oceanMesh: THREE.Mesh;
   private oceanMaterial: THREE.MeshStandardMaterial;
   private lighthouse: THREE.Group;
+  private lighthouseSecondary: THREE.Group;
   private sailboat: THREE.Group;
 
   constructor(scene: THREE.Scene) {
@@ -147,7 +176,7 @@ export class RoadManager {
     });
 
     // Mediterranean Ocean plane on the right side
-    const oceanGeo = new THREE.PlaneGeometry(160, 400, 32, 32);
+    const oceanGeo = new THREE.PlaneGeometry(180, 420, 32, 32);
     this.oceanMaterial = new THREE.MeshStandardMaterial({
       color: 0x0ca6d4, // Vibrant turquoise Mediterranean blue
       roughness: 0.15,
@@ -155,13 +184,19 @@ export class RoadManager {
     });
     this.oceanMesh = new THREE.Mesh(oceanGeo, this.oceanMaterial);
     this.oceanMesh.rotation.x = -Math.PI / 2;
-    this.oceanMesh.position.set(70, -0.6, -100);
+    this.oceanMesh.position.set(75, -0.6, -100);
     this.scene.add(this.oceanMesh);
 
-    // Distant landmark: Coastal lighthouse
+    // Primary coastal lighthouse on rocky promontory
     this.lighthouse = createLighthouse();
-    this.lighthouse.position.set(45, -0.2, -180);
+    this.lighthouse.position.set(48, -0.2, -180);
     this.scene.add(this.lighthouse);
+
+    // Secondary coastal lighthouse further ahead for richer horizon
+    this.lighthouseSecondary = createLighthouse();
+    this.lighthouseSecondary.scale.set(0.85, 0.85, 0.85);
+    this.lighthouseSecondary.position.set(38, -0.3, -380);
+    this.scene.add(this.lighthouseSecondary);
 
     // Distant landmark: White sailboat
     this.sailboat = createSailboat();
@@ -199,88 +234,175 @@ export class RoadManager {
     rightRail.rotation.y = Math.PI;
     group.add(rightRail);
 
-    // 3. Left Hill & Cliff Slopes (Mountain side)
-    const hillGeo = new THREE.PlaneGeometry(28, CHUNK_LENGTH, 8, 8);
-    // Displace vertices to create sloping cliffs
+    // 3. Roadside Reflector Bollards (Every 10m along both edges)
+    for (let zOffset = -CHUNK_LENGTH / 2 + 5; zOffset < CHUNK_LENGTH / 2; zOffset += 12) {
+      const leftPost = createReflectorPost(true);
+      leftPost.position.set(-ROAD_WIDTH / 2 - 0.18, 0, zOffset);
+      group.add(leftPost);
+
+      const rightPost = createReflectorPost(false);
+      rightPost.position.set(ROAD_WIDTH / 2 + 0.18, 0, zOffset);
+      group.add(rightPost);
+    }
+
+    // 4. Left Hill & Cliff Slopes (Mountain side)
+    const hillGeo = new THREE.PlaneGeometry(32, CHUNK_LENGTH, 8, 8);
     const hillPos = hillGeo.attributes.position;
     for (let i = 0; i < hillPos.count; i++) {
       const x = hillPos.getX(i);
-      // As x moves further left, height rises
-      const distFromRoad = Math.abs(x - 14);
-      const elevation = Math.pow(distFromRoad / 28, 1.4) * 12 + Math.sin(x * 0.5) * 1.5;
+      const distFromRoad = Math.abs(x - 16);
+      const elevation = Math.pow(distFromRoad / 32, 1.4) * 14 + Math.sin(x * 0.45) * 1.5;
       hillPos.setZ(i, elevation);
     }
     hillGeo.computeVertexNormals();
 
     const hill = new THREE.Mesh(hillGeo, this.cliffMaterial);
     hill.rotation.x = -Math.PI / 2;
-    hill.position.set(-ROAD_WIDTH / 2 - 14, 0, 0);
+    hill.position.set(-ROAD_WIDTH / 2 - 16, 0, 0);
     hill.receiveShadow = true;
     group.add(hill);
 
-    // 4. Right Beach Sand Strip
-    const beachGeo = new THREE.PlaneGeometry(16, CHUNK_LENGTH);
+    // 5. Right Beach Sand Strip
+    const beachGeo = new THREE.PlaneGeometry(20, CHUNK_LENGTH);
     const beach = new THREE.Mesh(beachGeo, this.sandMaterial);
     beach.rotation.x = -Math.PI / 2;
-    beach.position.set(ROAD_WIDTH / 2 + 8, -0.15, 0);
+    beach.position.set(ROAD_WIDTH / 2 + 10, -0.15, 0);
     beach.receiveShadow = true;
     group.add(beach);
 
-    // 5. Scenery props (Palms, Rocks, Signs)
-    // Left side: Palms, Rocks, Chevron warning signs
-    const palmPositionsLeft = [-CHUNK_LENGTH * 0.35, CHUNK_LENGTH * 0.15];
-    palmPositionsLeft.forEach((zOffset) => {
-      const palm = createPalmTree();
-      palm.position.set(-ROAD_WIDTH / 2 - 3.2 - Math.random() * 2.5, 0.4, zOffset);
+    // 6. Roadside Trees (Palms & Mediterranean Pines)
+    // Left verge trees
+    const treePositionsLeft = [
+      -CHUNK_LENGTH * 0.4,
+      -CHUNK_LENGTH * 0.15,
+      CHUNK_LENGTH * 0.2,
+      CHUNK_LENGTH * 0.42,
+    ];
+    treePositionsLeft.forEach((zOffset, idx) => {
+      // Alternate between majestic Coastal Pine and Palm tree
+      const isPine = (idx + chunkIndex) % 2 === 0;
+      const tree = isPine ? createPineTree() : createPalmTree();
+      tree.position.set(-ROAD_WIDTH / 2 - 3.4 - Math.random() * 3.5, 0.4, zOffset);
       const scale = 0.85 + Math.random() * 0.35;
-      palm.scale.set(scale, scale, scale);
-      group.add(palm);
+      tree.scale.set(scale, scale, scale);
+      group.add(tree);
     });
 
-    // Left rocks / boulders
-    const rockPositions = [-CHUNK_LENGTH * 0.4, 0, CHUNK_LENGTH * 0.35];
+    // Left rocks / boulders along mountain slope
+    const rockPositions = [
+      -CHUNK_LENGTH * 0.45,
+      -CHUNK_LENGTH * 0.25,
+      CHUNK_LENGTH * 0.05,
+      CHUNK_LENGTH * 0.35,
+    ];
     rockPositions.forEach((zOffset) => {
       const rock = createCliffRock();
-      rock.position.set(-ROAD_WIDTH / 2 - 2.8 - Math.random() * 3, 0.5, zOffset);
+      rock.position.set(-ROAD_WIDTH / 2 - 2.8 - Math.random() * 4, 0.5, zOffset);
       group.add(rock);
     });
 
-    // Road chevron warning sign on left guardrail
+    // Chevron warning signs
     if (chunkIndex % 2 === 0) {
       const sign = createWarningSign();
       sign.position.set(-ROAD_WIDTH / 2 - 0.7, 0, CHUNK_LENGTH * 0.1);
       group.add(sign);
     }
 
-    // Right side: Coastal palms and beach rocks
-    const palmPositionsRight = [-CHUNK_LENGTH * 0.25, CHUNK_LENGTH * 0.3];
-    palmPositionsRight.forEach((zOffset) => {
-      const palm = createPalmTree();
-      palm.position.set(ROAD_WIDTH / 2 + 4.5 + Math.random() * 3, -0.1, zOffset);
-      const scale = 0.9 + Math.random() * 0.3;
-      palm.scale.set(scale, scale, scale);
-      group.add(palm);
+    // Right side: Coastal palms and beach boulders
+    const treePositionsRight = [
+      -CHUNK_LENGTH * 0.35,
+      -CHUNK_LENGTH * 0.05,
+      CHUNK_LENGTH * 0.3,
+    ];
+    treePositionsRight.forEach((zOffset, idx) => {
+      const isPine = (idx + chunkIndex) % 3 === 0;
+      const tree = isPine ? createPineTree() : createPalmTree();
+      tree.position.set(ROAD_WIDTH / 2 + 4.2 + Math.random() * 3.8, -0.1, zOffset);
+      const scale = 0.9 + Math.random() * 0.35;
+      tree.scale.set(scale, scale, scale);
+      group.add(tree);
     });
+
+    // Right beach rocks
+    const beachRockOffsets = [-CHUNK_LENGTH * 0.28, CHUNK_LENGTH * 0.18];
+    beachRockOffsets.forEach((zOffset) => {
+      const rock = createCliffRock();
+      rock.position.set(ROAD_WIDTH / 2 + 3.8 + Math.random() * 3.2, 0.2, zOffset);
+      rock.scale.set(0.9, 0.9, 0.9);
+      group.add(rock);
+    });
+
+    // 7. Coastal Highway Lamps (Every chunk, alternating left/right for scenic rhythm)
+    const lampIsLeft = chunkIndex % 2 === 0;
+    const lamp = createHighwayLamp(lampIsLeft);
+    const lampX = lampIsLeft ? -ROAD_WIDTH / 2 - 0.7 : ROAD_WIDTH / 2 + 0.7;
+    lamp.position.set(lampX, 0, (chunkIndex % 3 === 0 ? -12 : 12));
+    group.add(lamp);
+
+    // 8. Mediterranean Flower Bushes (Bougainvillea / Coastal shrubbery)
+    const bushZOffsets = [-CHUNK_LENGTH * 0.38, -CHUNK_LENGTH * 0.08, CHUNK_LENGTH * 0.25];
+    bushZOffsets.forEach((zOff) => {
+      const bush = createCoastalBushes();
+      bush.position.set(-ROAD_WIDTH / 2 - 1.8 - Math.random() * 1.5, 0.2, zOff);
+      group.add(bush);
+    });
+
+    // 9. Seaside Scenic Wooden Post & Rail Fence (On the beach side)
+    const fence = createBeachFence(CHUNK_LENGTH * 0.75);
+    fence.position.set(ROAD_WIDTH / 2 + 1.2, 0, 0);
+    group.add(fence);
 
     return { group, zCenter };
   }
 
-  public update(playerZ: number, delta: number) {
-    // Ocean bobbing and gentle wave motion
+  public getOceanMaterial(): THREE.MeshStandardMaterial {
+    return this.oceanMaterial;
+  }
+
+  public update(playerZ: number, delta: number, speedKmH: number = 100) {
+    // Ocean wave animation for specular sun glints
     if (this.oceanMesh) {
       this.oceanMesh.position.z = playerZ - 100;
-      this.oceanMaterial.color.setHSL(0.53, 0.85, 0.42 + Math.sin(playerZ * 0.005) * 0.03);
+      const pos = (this.oceanMesh.geometry as THREE.BufferGeometry).attributes.position;
+      const time = Date.now() * 0.002;
+      for (let i = 0; i < pos.count; i += 2) {
+        const vx = pos.getX(i);
+        const vy = pos.getY(i);
+        const wave = Math.sin(vx * 0.12 + time * 2.0) * 0.28 + Math.cos(vy * 0.06 + time * 1.5) * 0.22;
+        pos.setZ(i, wave);
+      }
+      pos.needsUpdate = true;
+      (this.oceanMesh.geometry as THREE.BufferGeometry).computeVertexNormals();
     }
 
-    // Keep sailboat and lighthouse tracking gracefully
+    // Keep sailboat drifting gracefully
     if (this.sailboat) {
       this.sailboat.position.z = playerZ - 80 + Math.sin(playerZ * 0.01) * 10;
       this.sailboat.rotation.z = Math.sin(Date.now() * 0.002) * 0.06;
       this.sailboat.position.y = -0.5 + Math.sin(Date.now() * 0.002) * 0.1;
     }
+
+    // Spin lighthouse beacons (faster speed when player rushes)
+    const spinRate = (2.0 + (speedKmH / 120)) * delta;
     if (this.lighthouse) {
-      if (this.lighthouse.position.z > playerZ + 40) {
-        this.lighthouse.position.z = playerZ - 240;
+      const beacon = this.lighthouse.getObjectByName('beacon');
+      if (beacon) beacon.rotation.y += spinRate;
+
+      // Recycle primary lighthouse ahead when passed
+      if (this.lighthouse.position.z > playerZ + 45) {
+        this.lighthouse.position.z = playerZ - 260 - Math.random() * 40;
+        this.lighthouse.position.x = 45 + (Math.random() - 0.5) * 12;
+      }
+    }
+
+    if (this.lighthouseSecondary) {
+      const beacon = this.lighthouseSecondary.getObjectByName('beacon');
+      if (beacon) beacon.rotation.y += spinRate * 1.2;
+
+      // Recycle secondary lighthouse
+      if (this.lighthouseSecondary.position.z > playerZ + 45) {
+        this.lighthouseSecondary.position.z = playerZ - 420 - Math.random() * 50;
+        this.lighthouseSecondary.position.x = 38 + (Math.random() - 0.5) * 10;
       }
     }
 
@@ -310,7 +432,10 @@ export class RoadManager {
       this.chunks[i].group.position.z = zCenter;
     }
     if (this.lighthouse) {
-      this.lighthouse.position.set(45, -0.2, -180);
+      this.lighthouse.position.set(48, -0.2, -180);
+    }
+    if (this.lighthouseSecondary) {
+      this.lighthouseSecondary.position.set(38, -0.3, -380);
     }
     if (this.sailboat) {
       this.sailboat.position.set(65, -0.5, -90);
@@ -323,6 +448,7 @@ export class RoadManager {
     });
     this.scene.remove(this.oceanMesh);
     this.scene.remove(this.lighthouse);
+    this.scene.remove(this.lighthouseSecondary);
     this.scene.remove(this.sailboat);
   }
 }

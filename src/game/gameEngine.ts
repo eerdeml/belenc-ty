@@ -5,26 +5,78 @@
 
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { createPlayerCar, createTrafficCar, createCoin, CarParts } from './models';
+import {
+  createPlayerCar,
+  createTrafficCar,
+  createTrafficTruck,
+  createTrafficBus,
+  createTrafficSUV,
+  createCoin,
+  createMagnetModel,
+  createNitroModel,
+  CarParts,
+} from './models';
 import { RoadManager, LANE_WIDTH, LANE_POSITIONS } from './road';
 import { sound } from './audio';
+import { synthwaveBgm } from './synthwaveBgm';
+import { WeatherSystem, WeatherMode } from './weather';
+import { saveScoreToLeaderboard } from './leaderboard';
+import { achievements, Achievement } from './achievements';
+import { getEquippedCar, addBankCoins, getBankCoins, CarDefinition } from './cars';
 
 export type GameStatus = 'start' | 'playing' | 'paused' | 'gameover';
+export type PowerUpType = 'magnet' | 'boost';
+export type TrafficVehicleType = 'car' | 'suv' | 'truck' | 'bus';
+
+export interface ActivePowerUp {
+  type: PowerUpType;
+  remaining: number;
+  total: number;
+}
+
+export interface RunTimelinePoint {
+  distance: number;
+  difficulty: number; // 0 - 100%
+  speed: number;      // km/h
+}
 
 export interface GameStats {
   score: number;
   speedKmH: number;
   coins: number;
+  bankCoins: number;
   distanceMeters: number;
   highScore: number;
+  weatherMode: WeatherMode;
+  isAutoWeather: boolean;
+  activePowerUps: ActivePowerUp[];
+  lastRunId?: string;
+  equippedCar: CarDefinition;
+  lastCrashedVehicleType?: TrafficVehicleType;
+  runTimeline?: RunTimelinePoint[];
+}
+
+interface PowerUpItem {
+  type: PowerUpType;
+  group: THREE.Group;
+  mesh: THREE.Group;
+  shadow: THREE.Mesh;
+  laneIndex: number;
+  x: number;
+  z: number;
+  collected: boolean;
 }
 
 interface TrafficEntity {
   car: CarParts;
+  vehicleType: TrafficVehicleType;
   laneIndex: number;
   speed: number;
   z: number;
   x: number;
+  length: number;
+  width: number;
+  nearMissTriggered?: boolean;
 }
 
 interface CoinEntity {
@@ -45,6 +97,11 @@ interface Particle {
   maxLife: number;
 }
 
+interface SkidmarkSegment {
+  mesh: THREE.Mesh;
+  opacity: number;
+}
+
 export class GameEngine {
   private container: HTMLElement;
   private scene: THREE.Scene;
@@ -62,6 +119,7 @@ export class GameEngine {
   private speedKmH: number = 100;
   private baseSpeed: number = 28; // ~100 km/h in m/s
   private currentForwardSpeed: number = 28;
+  private lastRunId: string = '';
 
   // Player motion
   private currentLane: number = 0; // -1: Left, 0: Center, 1: Right
@@ -70,44 +128,79 @@ export class GameEngine {
   private playerZ: number = 0;
   private playerRoll: number = 0;
 
-  // Traffic & Coins
+  // Traffic, Coins & Power-ups
   private traffic: TrafficEntity[] = [];
   private coins: CoinEntity[] = [];
+  private powerUps: PowerUpItem[] = [];
   private trafficSpawnTimer: number = 0;
   private coinSpawnTimer: number = 0;
+  private powerUpSpawnTimer: number = 0;
+
+  // Active Power-up Durations
+  private magnetTimer: number = 0;
+  private boostTimer: number = 0;
+  private readonly magnetDuration: number = 9.0;
+  private readonly boostDuration: number = 6.5;
+
+  // Visual vehicle attachments
+  private playerShieldMesh!: THREE.Mesh;
+  private nitroFlames: THREE.Mesh[] = [];
 
   // Particle pool
   private particles: Particle[] = [];
   private particleGroup: THREE.Group;
 
+  // Skidmark Decals
+  private skidmarks: SkidmarkSegment[] = [];
+  private skidmarkGroup: THREE.Group;
+  private lastSkidZ: number = 0;
+
   // Camera & Shake
   private cameraShake: number = 0;
   private hitstopTimer: number = 0;
 
-  // Lights
+  // Lights & Atmosphere
   private dirLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
+  private weather: WeatherSystem;
 
   // Animation frame
   private frameId: number = 0;
   private lastTime: number = 0;
   private isDestroyed: boolean = false;
   private isSoftwareGl: boolean = false;
+  // Achievement & Run tracking
+  private runSurvivalSec: number = 0;
+  private overtakesThisRun: number = 0;
+  private nitroTriggeredThisRun: boolean = false;
+  private magnetTriggeredThisRun: boolean = false;
+
+  // Crash Vehicle & Timeline Tracking (Distance vs Difficulty & Speed)
+  private lastCrashedVehicleType: TrafficVehicleType | null = null;
+  private runTimeline: RunTimelinePoint[] = [];
+  private timelineRecordTimer: number = 0;
 
   // Callbacks
   private onStatsUpdate?: (stats: GameStats) => void;
   private onStatusChange?: (status: GameStatus) => void;
+  private onAchievementUnlocked?: (achievement: Achievement) => void;
 
   constructor(
     container: HTMLElement,
     callbacks?: {
       onStatsUpdate?: (stats: GameStats) => void;
       onStatusChange?: (status: GameStatus) => void;
+      onAchievementUnlocked?: (achievement: Achievement) => void;
     }
   ) {
     this.container = container;
     this.onStatsUpdate = callbacks?.onStatsUpdate;
     this.onStatusChange = callbacks?.onStatusChange;
+    this.onAchievementUnlocked = callbacks?.onAchievementUnlocked;
+
+    achievements.onUnlock((ach) => {
+      this.onAchievementUnlocked?.(ach);
+    });
 
     const savedHigh = localStorage.getItem('coastal_racer_highscore');
     if (savedHigh) {
@@ -134,7 +227,7 @@ export class GameEngine {
     // Warm Mediterranean blue-sky atmosphere
     const skyColor = new THREE.Color(0x73bbf8);
     this.scene.background = skyColor;
-    this.scene.fog = new THREE.FogExp2(0x89c7f9, 0.008);
+    this.scene.fog = new THREE.FogExp2(0x89c7f9, 0.007);
 
     // 3. Camera
     const width = container.clientWidth || window.innerWidth;
@@ -182,17 +275,58 @@ export class GameEngine {
     this.dirLight.shadow.normalBias = 0.02;
     this.scene.add(this.dirLight);
 
+    // Dynamic Weather System (Sun glare, mist, and atmospheric cycle)
+    this.weather = new WeatherSystem(this.scene, this.dirLight, this.hemiLight);
+
     // 7. Road & Scenery
     this.roadManager = new RoadManager(this.scene);
 
-    // 8. Player Red Supercar
-    this.player = createPlayerCar();
+    // 8. Player Supercar (Equipped Model)
+    const equipped = getEquippedCar();
+    this.player = createPlayerCar(equipped);
     this.player.group.position.set(0, 0, 0);
     this.scene.add(this.player.group);
 
-    // 9. Particle container
+    // Player Energy Shield & Nitro Exhaust Attachments
+    const shieldGeo = new THREE.SphereGeometry(2.1, 16, 12);
+    shieldGeo.scale(1.0, 0.65, 1.4);
+    const shieldMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.35,
+      wireframe: true,
+    });
+    this.playerShieldMesh = new THREE.Mesh(shieldGeo, shieldMat);
+    this.playerShieldMesh.position.y = 0.6;
+    this.playerShieldMesh.visible = false;
+    this.player.group.add(this.playerShieldMesh);
+
+    // Nitro exhaust fire cones
+    const flameGeo = new THREE.ConeGeometry(0.12, 0.65, 8);
+    flameGeo.rotateX(Math.PI / 2);
+    const flameMat = new THREE.MeshBasicMaterial({
+      color: equipped.neonColorHex || 0x06b6d4,
+      transparent: true,
+      opacity: 0.9,
+    });
+    const flameL = new THREE.Mesh(flameGeo, flameMat);
+    flameL.position.set(-0.46, 0.22, 2.15);
+    flameL.visible = false;
+    this.player.group.add(flameL);
+    this.nitroFlames.push(flameL);
+
+    const flameR = new THREE.Mesh(flameGeo, flameMat);
+    flameR.position.set(0.46, 0.22, 2.15);
+    flameR.visible = false;
+    this.player.group.add(flameR);
+    this.nitroFlames.push(flameR);
+
+    // 9. Particle container & Skidmark container
     this.particleGroup = new THREE.Group();
     this.scene.add(this.particleGroup);
+
+    this.skidmarkGroup = new THREE.Group();
+    this.scene.add(this.skidmarkGroup);
 
     // Listeners
     window.addEventListener('resize', this.onWindowResize);
@@ -278,9 +412,28 @@ export class GameEngine {
     this.playerRoll = 0;
     this.hitstopTimer = 0;
     this.cameraShake = 0;
+    this.lastRunId = '';
+
+    // Reset power-ups
+    this.magnetTimer = 0;
+    this.boostTimer = 0;
+    this.powerUpSpawnTimer = 0;
+    if (this.playerShieldMesh) this.playerShieldMesh.visible = false;
+    this.nitroFlames.forEach((f) => (f.visible = false));
+
+    // Reset run tracking for achievements & crash vehicle
+    this.runSurvivalSec = 0;
+    this.overtakesThisRun = 0;
+    this.nitroTriggeredThisRun = false;
+    this.magnetTriggeredThisRun = false;
+    this.lastCrashedVehicleType = null;
+    this.runTimeline = [{ distance: 0, difficulty: 0, speed: 100 }];
+    this.timelineRecordTimer = 0;
+    achievements.resetNewFlags();
 
     this.clearTraffic();
     this.clearCoins();
+    this.clearPowerUps();
     this.clearParticles();
     this.roadManager.reset();
 
@@ -288,6 +441,7 @@ export class GameEngine {
     this.spawnInitialObstacles();
 
     sound.startEngine();
+    synthwaveBgm.start();
     this.onStatusChange?.(this.status);
     this.notifyStats();
   }
@@ -301,6 +455,7 @@ export class GameEngine {
     } else if (this.status === 'paused') {
       this.status = 'playing';
       sound.startEngine();
+      synthwaveBgm.start();
       this.onStatusChange?.(this.status);
     }
   }
@@ -310,13 +465,73 @@ export class GameEngine {
     this.startGame();
   }
 
+  /**
+   * Reloads the player's 3D vehicle when changed in Garage
+   */
+  public reloadEquippedCar() {
+    if (!this.player) return;
+    this.scene.remove(this.player.group);
+    this.nitroFlames = [];
+
+    const equipped = getEquippedCar();
+    this.player = createPlayerCar(equipped);
+    this.player.group.position.set(this.playerX, 0, this.playerZ);
+    this.scene.add(this.player.group);
+
+    // Re-attach nitro flames
+    const flameGeo = new THREE.ConeGeometry(0.12, 0.65, 8);
+    flameGeo.rotateX(Math.PI / 2);
+    const flameMat = new THREE.MeshBasicMaterial({
+      color: equipped.neonColorHex || 0x06b6d4,
+      transparent: true,
+      opacity: 0.9,
+    });
+    const flameL = new THREE.Mesh(flameGeo, flameMat);
+    flameL.position.set(-0.46, 0.22, 2.15);
+    flameL.visible = false;
+    this.player.group.add(flameL);
+    this.nitroFlames.push(flameL);
+
+    const flameR = new THREE.Mesh(flameGeo, flameMat);
+    flameR.position.set(0.46, 0.22, 2.15);
+    flameR.visible = false;
+    this.player.group.add(flameR);
+    this.nitroFlames.push(flameR);
+
+    this.notifyStats();
+  }
+
   private notifyStats() {
+    const activePowerUps: ActivePowerUp[] = [];
+    if (this.magnetTimer > 0) {
+      activePowerUps.push({
+        type: 'magnet',
+        remaining: Math.max(0, this.magnetTimer),
+        total: this.magnetDuration,
+      });
+    }
+    if (this.boostTimer > 0) {
+      activePowerUps.push({
+        type: 'boost',
+        remaining: Math.max(0, this.boostTimer),
+        total: this.boostDuration,
+      });
+    }
+
     this.onStatsUpdate?.({
       score: Math.floor(this.score),
       speedKmH: Math.round(this.speedKmH),
       coins: this.coinsCount,
+      bankCoins: getBankCoins(),
       distanceMeters: Math.floor(this.distance),
       highScore: this.highScore,
+      weatherMode: this.weather ? this.weather.getWeatherMode() : 'sunny',
+      isAutoWeather: this.weather ? this.weather.isAutoCycling() : true,
+      activePowerUps,
+      lastRunId: this.lastRunId,
+      equippedCar: getEquippedCar(),
+      lastCrashedVehicleType: this.lastCrashedVehicleType || undefined,
+      runTimeline: [...this.runTimeline],
     });
   }
 
@@ -330,23 +545,67 @@ export class GameEngine {
   }
 
   private spawnTrafficAt(z: number, laneIndex: number) {
-    const colors = [0x1a68e8, 0xf5ba18, 0x14a768, 0xfa6400, 0x9333ea, 0xdfe6e9];
-    const color = colors[Math.floor(Math.random() * colors.length)];
-    const car = createTrafficCar(color);
-    const x = laneIndex * LANE_WIDTH;
+    const diffFactor = Math.min(1.0, this.distance / 1600);
 
+    // Pick vehicle type: standard sports car, SUV, semi-truck (Tır), or coach bus (Otobüs)
+    let vehicleType: TrafficVehicleType = 'car';
+    const rand = Math.random();
+    if (diffFactor < 0.25) {
+      if (rand < 0.65) vehicleType = 'car';
+      else if (rand < 0.85) vehicleType = 'suv';
+      else if (rand < 0.94) vehicleType = 'truck';
+      else vehicleType = 'bus';
+    } else {
+      if (rand < 0.40) vehicleType = 'car';
+      else if (rand < 0.60) vehicleType = 'suv';
+      else if (rand < 0.82) vehicleType = 'truck';
+      else vehicleType = 'bus';
+    }
+
+    const colors = [0x1a68e8, 0xf5ba18, 0x14a768, 0xfa6400, 0x9333ea, 0xdfe6e9, 0xdc2626, 0x0284c7];
+    const color = colors[Math.floor(Math.random() * colors.length)];
+
+    let car: CarParts;
+    let length = 3.6;
+    let width = 1.5;
+
+    if (vehicleType === 'truck') {
+      car = createTrafficTruck(color);
+      length = 6.8;
+      width = 1.85;
+    } else if (vehicleType === 'bus') {
+      car = createTrafficBus(color);
+      length = 7.5;
+      width = 1.85;
+    } else if (vehicleType === 'suv') {
+      car = createTrafficSUV(color);
+      length = 4.2;
+      width = 1.65;
+    } else {
+      car = createTrafficCar(color);
+      length = 3.6;
+      width = 1.5;
+    }
+
+    const x = laneIndex * LANE_WIDTH;
     car.group.position.set(x, 0, z);
     this.scene.add(car.group);
 
-    // Traffic cruising speed relative to player
-    const trafficSpeed = 16 + Math.random() * 6; // ~60-80 km/h
+    // Dynamic traffic speed: trucks & buses are heavier and drive slightly slower
+    const baseMin = (vehicleType === 'truck' || vehicleType === 'bus') ? 13 : 15;
+    const baseTrafficSpeed = baseMin + Math.random() * 6;
+    const speedVariation = (Math.random() - 0.5) * (diffFactor * 8);
+    const trafficSpeed = Math.max(10, baseTrafficSpeed + speedVariation);
 
     this.traffic.push({
       car,
+      vehicleType,
       laneIndex,
       speed: trafficSpeed,
       z,
       x,
+      length,
+      width,
     });
   }
 
@@ -385,11 +644,161 @@ export class GameEngine {
     this.coins = [];
   }
 
+  private spawnPowerUpAt(z: number, laneIndex: number, type: PowerUpType) {
+    const model = type === 'magnet' ? createMagnetModel() : createNitroModel();
+    const x = laneIndex * LANE_WIDTH;
+    model.group.position.set(x, 0, z);
+    this.scene.add(model.group);
+
+    this.powerUps.push({
+      type,
+      group: model.group,
+      mesh: model.mesh,
+      shadow: model.shadow,
+      laneIndex,
+      x,
+      z,
+      collected: false,
+    });
+  }
+
+  private clearPowerUps() {
+    this.powerUps.forEach((p) => {
+      this.scene.remove(p.group);
+    });
+    this.powerUps = [];
+  }
+
   private clearParticles() {
     this.particles.forEach((p) => {
       this.particleGroup.remove(p.mesh);
     });
     this.particles = [];
+
+    this.skidmarks.forEach((s) => {
+      this.skidmarkGroup.remove(s.mesh);
+      s.mesh.geometry.dispose();
+      (s.mesh.material as THREE.Material).dispose();
+    });
+    this.skidmarks = [];
+  }
+
+  private createSkidmarkPair(x: number, z: number) {
+    if (this.skidmarks.length > 60) {
+      const oldest = this.skidmarks.shift();
+      if (oldest) {
+        this.skidmarkGroup.remove(oldest.mesh);
+        oldest.mesh.geometry.dispose();
+        (oldest.mesh.material as THREE.Material).dispose();
+      }
+    }
+
+    const geo = new THREE.PlaneGeometry(0.24, 1.4);
+    geo.rotateX(-Math.PI / 2);
+
+    [-0.72, 0.72].forEach((offset) => {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x111317,
+        transparent: true,
+        opacity: 0.55,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x + offset, 0.015, z + 1.15);
+      this.skidmarkGroup.add(mesh);
+      this.skidmarks.push({ mesh, opacity: 0.55 });
+    });
+  }
+
+  private updateSkidmarks(delta: number) {
+    for (let i = this.skidmarks.length - 1; i >= 0; i--) {
+      const s = this.skidmarks[i];
+      s.opacity -= delta * 0.45;
+      if (s.opacity <= 0) {
+        this.skidmarkGroup.remove(s.mesh);
+        s.mesh.geometry.dispose();
+        (s.mesh.material as THREE.Material).dispose();
+        this.skidmarks.splice(i, 1);
+      } else {
+        (s.mesh.material as THREE.MeshBasicMaterial).opacity = s.opacity;
+      }
+    }
+  }
+
+  private emitNearMissParticles(x: number, y: number, z: number) {
+    // 1. Slipstream Wind Streaks
+    const streakGeo = new THREE.PlaneGeometry(0.08, 3.2);
+    streakGeo.rotateX(-Math.PI / 2);
+    const streakMat = new THREE.MeshBasicMaterial({
+      color: 0xa5f3fc,
+      transparent: true,
+      opacity: 0.85,
+      side: THREE.DoubleSide,
+    });
+
+    for (let i = 0; i < 4; i++) {
+      const mesh = new THREE.Mesh(streakGeo, streakMat);
+      mesh.position.set(
+        x + (Math.random() - 0.5) * 0.6,
+        y + 0.2 + (Math.random() - 0.5) * 0.4,
+        z + (Math.random() - 0.5) * 1.5
+      );
+      this.particleGroup.add(mesh);
+      this.particles.push({
+        mesh,
+        vel: new THREE.Vector3((Math.random() - 0.5) * 2, 0.5, 30 + Math.random() * 20),
+        life: 0,
+        maxLife: 0.2,
+      });
+    }
+
+    // 2. Dust puffs
+    const dustGeo = new THREE.SphereGeometry(0.12, 6, 6);
+    const dustMat = new THREE.MeshBasicMaterial({
+      color: 0xd1d5db,
+      transparent: true,
+      opacity: 0.6,
+    });
+
+    for (let i = 0; i < 6; i++) {
+      const mesh = new THREE.Mesh(dustGeo, dustMat);
+      mesh.position.set(x + (Math.random() - 0.5) * 0.5, 0.15, z);
+      this.particleGroup.add(mesh);
+      this.particles.push({
+        mesh,
+        vel: new THREE.Vector3(
+          (Math.random() - 0.5) * 3,
+          0.8 + Math.random() * 1.5,
+          8 + Math.random() * 10
+        ),
+        life: 0,
+        maxLife: 0.35,
+      });
+    }
+  }
+
+  private emitSpeedDust(x: number, z: number) {
+    const geo = new THREE.SphereGeometry(0.08, 6, 6);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xe2e8f0,
+      transparent: true,
+      opacity: 0.45,
+    });
+    [-0.65, 0.65].forEach((offsetX) => {
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x + offsetX, 0.1, z + 1.2);
+      this.particleGroup.add(mesh);
+      this.particles.push({
+        mesh,
+        vel: new THREE.Vector3(
+          (Math.random() - 0.5) * 1.2,
+          0.5 + Math.random() * 0.8,
+          6 + Math.random() * 8
+        ),
+        life: 0,
+        maxLife: 0.3,
+      });
+    });
   }
 
   private emitCoinParticles(x: number, y: number, z: number) {
@@ -456,10 +865,24 @@ export class GameEngine {
     sound.stopEngine();
     sound.playCrash();
 
-    // Check high score
-    if (this.score > this.highScore) {
-      this.highScore = Math.floor(this.score);
-      localStorage.setItem('coastal_racer_highscore', String(this.highScore));
+    // Record final data point in timeline
+    const diffFactor = Math.min(1.0, this.distance / 1600);
+    this.runTimeline.push({
+      distance: Math.round(this.distance),
+      difficulty: Math.round(diffFactor * 100),
+      speed: Math.round(this.speedKmH),
+    });
+
+    // Save run to local leaderboard
+    if (this.score > 0) {
+      const record = saveScoreToLeaderboard({
+        score: this.score,
+        coins: this.coinsCount,
+        distanceMeters: this.distance,
+        maxSpeedKmH: this.speedKmH,
+      });
+      this.lastRunId = record.entry.id;
+      this.highScore = Math.max(this.highScore, record.entry.score);
     }
 
     this.emitCrashParticles(this.playerX, 0.5, this.playerZ);
@@ -490,6 +913,10 @@ export class GameEngine {
       // Idle gentle bob and slow drift for attractive visual preview
       const t = currentTime * 0.001;
       this.player.group.position.y = Math.sin(t * 3) * 0.02;
+      this.roadManager.update(this.playerZ, delta);
+      this.weather.update(this.playerZ, delta, this.roadManager.getOceanMaterial());
+    } else if (this.status === 'paused') {
+      this.weather.update(this.playerZ, delta, this.roadManager.getOceanMaterial());
     }
 
     // Camera follow with dynamic damping & shake
@@ -505,15 +932,75 @@ export class GameEngine {
   };
 
   private updateSimulation(delta: number) {
-    // 1. Difficulty Ramp: Speed increases smoothly over distance
-    // Starts at 100 km/h (~27.8 m/s), scales up to 180+ km/h
+    // 1. Difficulty Ramp & Power-up Timers
+    if (this.magnetTimer > 0) {
+      this.magnetTimer = Math.max(0, this.magnetTimer - delta);
+    }
+    if (this.boostTimer > 0) {
+      this.boostTimer = Math.max(0, this.boostTimer - delta);
+    }
+
     this.distance += this.currentForwardSpeed * delta;
-    const speedRatio = Math.min(this.distance / 1200, 1.0); // 1200 meters to max speed
-    this.speedKmH = 100 + speedRatio * 80; // 100 km/h to 180 km/h
+    const speedRatio = Math.min(this.distance / 1200, 1.0); // 1200 meters to base max speed
+    const boostSpeedBonus = this.boostTimer > 0 ? 55 : 0;
+    
+    // Apply car speed perk bonus
+    const equipped = getEquippedCar();
+    const speedPerk = equipped.bonusType === 'speed_boost' ? (equipped.bonusValue || 1.15) : 1.0;
+    this.speedKmH = (100 + speedRatio * 80 + boostSpeedBonus) * speedPerk;
     this.currentForwardSpeed = this.speedKmH / 3.6;
+
+    // Record timeline samples every ~1.6 seconds for Recharts distance vs difficulty chart
+    this.timelineRecordTimer += delta;
+    if (this.timelineRecordTimer >= 1.6) {
+      this.timelineRecordTimer = 0;
+      this.runTimeline.push({
+        distance: Math.round(this.distance),
+        difficulty: Math.round(speedRatio * 100),
+        speed: Math.round(this.speedKmH),
+      });
+      if (this.runTimeline.length > 50) {
+        this.runTimeline.shift();
+      }
+    }
+
+    // Modulate Synthwave BGM tempo dynamically to player speed
+    synthwaveBgm.setSpeed(this.speedKmH);
+
+    // Camera dynamic FOV (widens to 64 during nitro boost for speed rush feel)
+    const targetFov = this.boostTimer > 0 ? 64 : 54;
+    if (Math.abs(this.camera.fov - targetFov) > 0.1) {
+      this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 8, delta);
+      this.camera.updateProjectionMatrix();
+    }
+
+    // Vehicle visual attachments: Blazing nitro flames (no shield, crash remains active!)
+    if (this.playerShieldMesh) {
+      this.playerShieldMesh.visible = false;
+    }
+
+    this.nitroFlames.forEach((flame) => {
+      flame.visible = this.boostTimer > 0;
+      if (this.boostTimer > 0) {
+        const flicker = 0.8 + Math.random() * 0.6;
+        flame.scale.set(1, 1, flicker);
+      }
+    });
 
     // Score increases with distance traveled + points
     this.score += (this.currentForwardSpeed * delta) * 1.5;
+
+    // Track survival time and live achievements
+    this.runSurvivalSec += delta;
+    achievements.updateLiveRun({
+      runSurvivalSec: this.runSurvivalSec,
+      coinsCollectedThisRun: this.coinsCount,
+      currentSpeedKmH: this.speedKmH,
+      overtakesThisRun: this.overtakesThisRun,
+      nitroTriggered: this.nitroTriggeredThisRun,
+      magnetTriggered: this.magnetTriggeredThisRun,
+      distanceMeters: this.distance,
+    });
 
     // Update sound engine pitch
     sound.updateEngine(this.speedKmH);
@@ -533,6 +1020,22 @@ export class GameEngine {
     this.player.group.rotation.y = -xDiff * 0.08;
     this.player.group.rotation.z = this.playerRoll;
 
+    // Spawn tire skidmark decals during cornering or nitro acceleration
+    const isCornering = Math.abs(xDiff) > 0.08;
+    const isBoost = this.boostTimer > 0;
+    if ((isCornering || isBoost) && Math.abs(this.playerZ - this.lastSkidZ) > 1.3) {
+      this.lastSkidZ = this.playerZ;
+      this.createSkidmarkPair(this.playerX, this.playerZ);
+    }
+
+    // High speed road dust puffs behind tires
+    if (this.speedKmH > 115 && Math.random() < 0.28) {
+      this.emitSpeedDust(this.playerX, this.playerZ);
+    }
+
+    // Update and fade active skidmarks
+    this.updateSkidmarks(delta);
+
     // Spin player wheels
     const wheelRot = this.currentForwardSpeed * delta * 3.5;
     this.player.wheels.forEach((w) => {
@@ -544,45 +1047,63 @@ export class GameEngine {
     this.dirLight.target.position.set(this.playerX, 0, this.playerZ - 10);
     this.dirLight.target.updateMatrixWorld();
 
-    // 5. Update Road chunks & ocean scenery
-    this.roadManager.update(this.playerZ, delta);
+    // 5. Update Road chunks & ocean scenery & dynamic weather
+    this.roadManager.update(this.playerZ, delta, this.speedKmH);
+    this.weather.update(this.playerZ, delta, this.roadManager.getOceanMaterial());
 
-    // 6. Spawn traffic & coins
+    // 6. Spawn traffic, coins & power-ups
     this.updateSpawners(delta);
 
     // 7. Update Traffic AI & check collisions
     this.updateTraffic(delta);
 
-    // 8. Update Coins & check pickup
+    // 8. Update Coins & magnet attraction
     this.updateCoins(delta);
 
-    // 9. Emit stats update periodically
+    // 9. Update Power-ups
+    this.updatePowerUps(delta);
+
+    // 10. Emit stats update periodically
     this.notifyStats();
   }
 
   private updateSpawners(delta: number) {
     this.trafficSpawnTimer += delta;
     this.coinSpawnTimer += delta;
+    this.powerUpSpawnTimer += delta;
 
-    // Traffic spawn frequency scales with speed
-    const trafficInterval = Math.max(1.3, 2.6 - (this.speedKmH - 100) * 0.012);
+    // Progressive difficulty: increases with distance traveled (from 0 up to 1.0 at 1600m+)
+    const diffFactor = Math.min(1.0, this.distance / 1600);
+
+    // Traffic spawn frequency accelerates noticeably with distance/difficulty & speed
+    const trafficInterval = Math.max(0.72, 2.3 - diffFactor * 1.15 - (this.speedKmH - 100) * 0.007);
     if (this.trafficSpawnTimer > trafficInterval) {
       this.trafficSpawnTimer = 0;
 
-      // Pick a random lane, but make sure not all 3 lanes are blocked in close proximity
       const availableLanes = [-1, 0, 1];
-      // Check which lanes have a car within 30m of spawn point
       const spawnZ = this.playerZ - 120;
+      // As difficulty increases, tighter spacing between oncoming vehicles
+      const clearanceZ = Math.max(14, 26 - diffFactor * 12);
       const blockedLanes = new Set(
         this.traffic
-          .filter((t) => Math.abs(t.z - spawnZ) < 28)
+          .filter((t) => Math.abs(t.z - spawnZ) < clearanceZ)
           .map((t) => t.laneIndex)
       );
 
       const openLanes = availableLanes.filter((l) => !blockedLanes.has(l));
       if (openLanes.length > 0) {
-        const lane = openLanes[Math.floor(Math.random() * openLanes.length)];
-        this.spawnTrafficAt(spawnZ, lane);
+        // High difficulty wave: occasionally spawn 2 cars leaving only 1 escape lane for sharp slalom
+        const shouldSpawnDouble = diffFactor > 0.35 && openLanes.length >= 2 && Math.random() < diffFactor * 0.42;
+        if (shouldSpawnDouble) {
+          const firstLane = openLanes[Math.floor(Math.random() * openLanes.length)];
+          const remainingLanes = openLanes.filter((l) => l !== firstLane);
+          const secondLane = remainingLanes[Math.floor(Math.random() * remainingLanes.length)];
+          this.spawnTrafficAt(spawnZ, firstLane);
+          this.spawnTrafficAt(spawnZ - (Math.random() * 8 + 4), secondLane);
+        } else {
+          const lane = openLanes[Math.floor(Math.random() * openLanes.length)];
+          this.spawnTrafficAt(spawnZ, lane);
+        }
       }
     }
 
@@ -593,6 +1114,57 @@ export class GameEngine {
       const spawnZ = this.playerZ - 90;
       const count = 3 + Math.floor(Math.random() * 3);
       this.spawnCoinGroupAt(spawnZ, coinLane, count);
+    }
+
+    // Power-up spawn (every ~14 to 18 seconds)
+    if (this.powerUpSpawnTimer > 15.0) {
+      this.powerUpSpawnTimer = 0;
+      const lane = Math.floor(Math.random() * 3) - 1;
+      const type: PowerUpType = Math.random() > 0.5 ? 'magnet' : 'boost';
+      const spawnZ = this.playerZ - 105;
+      this.spawnPowerUpAt(spawnZ, lane, type);
+    }
+  }
+
+  private updatePowerUps(delta: number) {
+    const time = performance.now() * 0.003;
+
+    for (let i = this.powerUps.length - 1; i >= 0; i--) {
+      const p = this.powerUps[i];
+
+      // Spin and hover
+      p.mesh.rotation.y += delta * 3.5;
+      p.mesh.position.y = 0.65 + Math.sin(time * 3 + p.z) * 0.12;
+
+      // Check pickup
+      const dx = Math.abs(this.playerX - p.x);
+      const dz = Math.abs(this.playerZ - p.z);
+
+      if (!p.collected && dx < 1.4 && dz < 2.0) {
+        p.collected = true;
+
+        if (p.type === 'magnet') {
+          this.magnetTimer = this.magnetDuration;
+          this.magnetTriggeredThisRun = true;
+          sound.playPowerUp();
+        } else {
+          this.boostTimer = this.boostDuration;
+          this.nitroTriggeredThisRun = true;
+          sound.playNitro();
+        }
+
+        this.score += 100;
+        this.emitCoinParticles(p.x, p.mesh.position.y, p.z);
+        this.scene.remove(p.group);
+        this.powerUps.splice(i, 1);
+        continue;
+      }
+
+      // Despawn if passed
+      if (p.z > this.playerZ + 25) {
+        this.scene.remove(p.group);
+        this.powerUps.splice(i, 1);
+      }
     }
   }
 
@@ -608,20 +1180,44 @@ export class GameEngine {
         w.rotation.x -= entity.speed * delta * 3.5;
       });
 
-      // Collision detection with player
+      // Dynamic collision detection with player (Active even during nitro boost - no protection!)
       const dx = Math.abs(this.playerX - entity.x);
       const dz = Math.abs(this.playerZ - entity.z);
 
-      if (dx < 1.35 && dz < 3.2) {
-        // Impact!
+      const collisionLength = (entity.length + 3.6) * 0.44;
+      const collisionWidth = (entity.width + 1.45) * 0.44;
+
+      if (dx < collisionWidth && dz < collisionLength) {
+        // High speed crash during nitro has even higher camera shake!
+        if (this.boostTimer > 0) {
+          this.cameraShake = 1.3;
+        }
+        this.lastCrashedVehicleType = entity.vehicleType;
         this.triggerCrash();
         return;
+      }
+
+      // Close pass detection ("Makas" / near-miss overtake with slipstream & dust)
+      if (!entity.nearMissTriggered && this.currentForwardSpeed > entity.speed) {
+        const lateralDist = Math.abs(this.playerX - entity.x);
+        const longDist = entity.z - this.playerZ;
+        const triggerDepth = (entity.length + 3.6) * 0.5;
+        if (lateralDist > collisionWidth && lateralDist < collisionWidth + 1.2 && Math.abs(longDist) < triggerDepth) {
+          entity.nearMissTriggered = true;
+          this.score += 35; // Bonus score for near miss
+          this.emitNearMissParticles(
+            (this.playerX + entity.x) / 2,
+            0.5,
+            (this.playerZ + entity.z) / 2
+          );
+        }
       }
 
       // Despawn traffic when far behind player (player has overtaken them)
       if (entity.z > this.playerZ + 35) {
         this.scene.remove(entity.car.group);
         this.traffic.splice(i, 1);
+        this.overtakesThisRun++;
         // Bonus points for clean overtaking!
         this.score += 25;
       }
@@ -634,6 +1230,20 @@ export class GameEngine {
     for (let i = this.coins.length - 1; i >= 0; i--) {
       const coin = this.coins[i];
 
+      // Magnet Attraction Physics: pull coins towards player when magnet is active
+      if (this.magnetTimer > 0) {
+        const equipped = getEquippedCar();
+        const maxDist = equipped.bonusType === 'magnet_boost' ? 44 : 32;
+        const distToPlayer = Math.hypot(this.playerX - coin.x, this.playerZ - coin.z);
+        if (distToPlayer < maxDist) {
+          const pull = Math.min(1, delta * 15);
+          coin.x += (this.playerX - coin.x) * pull;
+          coin.z += (this.playerZ - coin.z) * pull;
+          coin.group.position.x = coin.x;
+          coin.group.position.z = coin.z;
+        }
+      }
+
       // Spin coin continuously
       coin.mesh.rotation.z += delta * 4.0;
       // Gentle vertical hover bob
@@ -645,8 +1255,13 @@ export class GameEngine {
 
       if (!coin.collected && dx < 1.4 && dz < 1.8) {
         coin.collected = true;
-        this.coinsCount++;
-        this.score += 50; // +50 points per coin
+        const equipped = getEquippedCar();
+        const mult = equipped.bonusType === 'coin_boost' ? (equipped.bonusValue || 1.5) : 1.0;
+        const earned = Math.round(1 * mult);
+        this.coinsCount += earned;
+        addBankCoins(earned); // Instant deposit so garage always reflects current coins!
+        this.score += 50 * earned; // +50 points per coin
+        achievements.recordCoinsCollected(earned);
         sound.playCoin();
         this.emitCoinParticles(coin.x, coin.mesh.position.y, coin.z);
         this.scene.remove(coin.group);
@@ -682,14 +1297,16 @@ export class GameEngine {
   }
 
   private updateCamera(delta: number) {
-    // Camera smoothly follows player with subtle offset
+    // Dynamic camera: as speed increases, elevate the camera and pull back slightly
+    // for an expansive, cinematic highway view
+    const speedFactor = Math.max(0, Math.min(1.0, (this.speedKmH - 100) / 115));
     const targetCamX = this.playerX * 0.35;
-    const targetCamY = 3.6;
-    const targetCamZ = this.playerZ + 7.4;
+    const targetCamY = 3.6 + speedFactor * 1.5; // Elevates from 3.6m to 5.1m
+    const targetCamZ = this.playerZ + 7.4 + speedFactor * 1.6; // Pulls back from 7.4m to 9.0m
 
     this.camera.position.x += (targetCamX - this.camera.position.x) * Math.min(1, delta * 12);
-    this.camera.position.y = targetCamY;
-    this.camera.position.z = targetCamZ;
+    this.camera.position.y += (targetCamY - this.camera.position.y) * Math.min(1, delta * 6);
+    this.camera.position.z += (targetCamZ - this.camera.position.z) * Math.min(1, delta * 12);
 
     // Apply camera shake if any
     if (this.cameraShake > 0) {
@@ -698,12 +1315,32 @@ export class GameEngine {
       this.cameraShake = Math.max(0, this.cameraShake - delta * 2.5);
     }
 
-    // Look at point ahead on the highway
-    this.camera.lookAt(this.playerX * 0.25, 1.1, this.playerZ - 14);
+    // Dynamic LookAt: looks further down the coastal highway as speed increases
+    const targetLookAtX = this.playerX * 0.25;
+    const targetLookAtY = 1.1 + speedFactor * 0.45;
+    const targetLookAtZ = this.playerZ - 14 - speedFactor * 13;
+    this.camera.lookAt(targetLookAtX, targetLookAtY, targetLookAtZ);
   }
 
   public getStatus(): GameStatus {
     return this.status;
+  }
+
+  public nextWeather(): WeatherMode {
+    const mode = this.weather.nextWeather();
+    this.notifyStats();
+    return mode;
+  }
+
+  public setWeather(mode: WeatherMode) {
+    this.weather.setWeather(mode);
+    this.notifyStats();
+  }
+
+  public toggleAutoWeather(): boolean {
+    const auto = this.weather.toggleAutoCycle();
+    this.notifyStats();
+    return auto;
   }
 
   public destroy() {
@@ -712,11 +1349,14 @@ export class GameEngine {
     window.removeEventListener('resize', this.onWindowResize);
     window.removeEventListener('keydown', this.onKeyDown);
     sound.stopEngine();
+    synthwaveBgm.stop();
 
     this.clearTraffic();
     this.clearCoins();
+    this.clearPowerUps();
     this.clearParticles();
     this.roadManager.dispose();
+    this.weather.dispose();
 
     this.renderer.dispose();
     if (this.renderer.domElement && this.renderer.domElement.parentNode) {
