@@ -1,0 +1,6 @@
+{
+  "name": "Sahil Otobanı - 3D Araba Yarışı",
+  "description": "Sahil yolunda kırmızı spor araba ile şerit değiştir, altınları topla ve trafiğe çarpmadan en yüksek skora ulaş!",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
